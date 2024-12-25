@@ -23,6 +23,8 @@ else ifeq ($(OS),linux)
 	GPU_COMPILER_CXXFLAGS = $(CXXFLAGS) -fPIC -D_GNU_SOURCE
 endif
 GPU_COMPILER=$(HIP_COMPILER)
+GPU_C_COMPILER=$(HIP_COMPILER)
+GPU_CXX_COMPILER=$(HIP_COMPILER)
 
 # TODO future multi-variant support for ROCm
 # ROCM_VERSION = $(subst $(space),.,$(wordlist 1,2,$(subst .,$(space),$(word 3,$(subst -,$(space),$(filter HIP version: %,$(shell $(GPU_COMPILER) --version)))))))

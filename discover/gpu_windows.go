@@ -47,6 +47,8 @@ var (
 	NvcudaMgmtName = "nvcuda.dll"
 	NvmlMgmtName   = "nvml.dll"
 	OneapiMgmtName = "ze_intel_gpu64.dll"
+	// fake
+	MusartMgmtName = "musart.dll"
 )
 
 func GetCPUMem() (memInfo, error) {

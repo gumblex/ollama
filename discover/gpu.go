@@ -11,6 +11,7 @@ package discover
 import "C"
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -38,9 +39,15 @@ type oneapiHandles struct {
 	deviceCount int
 }
 
+type musaHandles struct {
+	deviceCount int
+	musart      *C.musart_handle_t
+}
+
 const (
 	cudaMinimumMemory = 457 * format.MebiByte
 	rocmMinimumMemory = 457 * format.MebiByte
+	musaMinimumMemory = 457 * format.MebiByte
 	// TODO OneAPI minimum memory
 )
 
@@ -53,8 +60,10 @@ var (
 	cudartLibPath string
 	oneapiLibPath string
 	nvmlLibPath   string
+	musartLibPath string
 	rocmGPUs      []RocmGPUInfo
 	oneapiGPUs    []OneapiGPUInfo
+	musaGPUs      []MusaGPUInfo
 
 	// If any discovered GPUs are incompatible, report why
 	unsupportedGPUs []UnsupportedGPUInfo
@@ -183,6 +192,51 @@ func initOneAPIHandles() *oneapiHandles {
 	return oHandles
 }
 
+// Note: gpuMutex must already be held
+func initMusaHandles() *musaHandles {
+	// TODO - if the ollama build is CPU only, don't do these checks as they're irrelevant and confusing
+
+	cHandles := &musaHandles{}
+	// Short Circuit if we already know which library to use
+	// ignore bootstrap errors in this case since we already recorded them
+	if musartLibPath != "" {
+		cHandles.deviceCount, cHandles.musart, _, _ = loadMUSARTMgmt([]string{musartLibPath})
+		return cHandles
+	}
+
+	slog.Debug("searching for GPU discovery libraries for Moore Threads")
+	musartMgmtPatterns := []string{}
+	musaInstallPath := os.Getenv("MUSA_INSTALL_PATH")
+	if musaInstallPath != "" {
+		musartMgmtPatterns = append(
+			musartMgmtPatterns,
+			filepath.Join(musaInstallPath, "lib", MusartMgmtName))
+	}
+
+	libDirs := LibraryDirs()
+	for _, d := range libDirs {
+		musartMgmtPatterns = append(musartMgmtPatterns, filepath.Join(d, MusartMgmtName))
+	}
+	musartMgmtPatterns = append(musartMgmtPatterns, MusartGlobs...)
+
+	musartLibPaths := FindGPULibs(MusartMgmtName, musartMgmtPatterns)
+	if len(musartLibPaths) > 0 {
+		deviceCount, musart, libPath, err := loadMUSARTMgmt(musartLibPaths)
+		if musart != nil {
+			slog.Debug("detected GPUs", "library", libPath, "count", deviceCount)
+			cHandles.musart = musart
+			cHandles.deviceCount = deviceCount
+			musartLibPath = libPath
+			return cHandles
+		}
+		if err != nil {
+			bootstrapErrors = append(bootstrapErrors, err)
+		}
+	}
+
+	return cHandles
+}
+
 func GetCPUInfo() GpuInfoList {
 	gpuMutex.Lock()
 	if !bootstrapped {
@@ -202,6 +256,7 @@ func GetGPUInfo() GpuInfoList {
 	needRefresh := true
 	var cHandles *cudaHandles
 	var oHandles *oneapiHandles
+	var mHandles *musaHandles
 	defer func() {
 		if cHandles != nil {
 			if cHandles.cudart != nil {
@@ -293,22 +348,7 @@ func GetGPUInfo() GpuInfoList {
 				gpuInfo.MinimumMemory = cudaMinimumMemory
 				gpuInfo.DriverMajor = driverMajor
 				gpuInfo.DriverMinor = driverMinor
-				variant := cudaVariant(gpuInfo)
-				if depPaths != nil {
-					gpuInfo.DependencyPath = depPaths
-					// Check for variant specific directory
-					if variant != "" {
-						for _, d := range depPaths {
-							if _, err := os.Stat(filepath.Join(d, "cuda_"+variant)); err == nil {
-								// Put the variant directory first in the search path to avoid runtime linking to the wrong library
-								gpuInfo.DependencyPath = append([]string{filepath.Join(d, "cuda_"+variant)}, gpuInfo.DependencyPath...)
-								break
-							}
-						}
-					}
-				}
 				gpuInfo.Name = C.GoString(&memInfo.gpu_name[0])
-				gpuInfo.Variant = variant
 
 				if int(memInfo.major) < cudaComputeMajorMin || (int(memInfo.major) == cudaComputeMajorMin && int(memInfo.minor) < cudaComputeMinorMin) {
 					unsupportedGPUs = append(unsupportedGPUs,
@@ -387,8 +427,14 @@ func GetGPUInfo() GpuInfoList {
 		if err != nil {
 			bootstrapErrors = append(bootstrapErrors, err)
 		}
+
+		musaGPUs, mHandles, err = mtGetGPUInfo()
+		if err != nil {
+			bootstrapErrors = append(bootstrapErrors, err)
+		}
+
 		bootstrapped = true
-		if len(cudaGPUs) == 0 && len(rocmGPUs) == 0 && len(oneapiGPUs) == 0 {
+		if len(cudaGPUs) == 0 && len(rocmGPUs) == 0 && len(oneapiGPUs) == 0 && len(musaGPUs) == 0 {
 			slog.Info("no compatible GPUs were discovered")
 		}
 
@@ -492,6 +538,13 @@ func GetGPUInfo() GpuInfoList {
 		if err != nil {
 			slog.Debug("problem refreshing ROCm free memory", "error", err)
 		}
+
+		if mHandles == nil && len(musaGPUs) > 0 {
+			mHandles = initMusaHandles()
+		}
+		for _, gpu := range musaGPUs {
+			mHandles.RefreshFreeMemory(gpu)
+		}
 	}
 
 	resp := []GpuInfo{}
@@ -504,6 +557,9 @@ func GetGPUInfo() GpuInfoList {
 	for _, gpu := range oneapiGPUs {
 		resp = append(resp, gpu.GpuInfo)
 	}
+	for _, gpu := range musaGPUs {
+		resp = append(resp, gpu.GpuInfo)
+	}
 	if len(resp) == 0 {
 		resp = append(resp, cpus[0].GpuInfo)
 	}
@@ -511,6 +567,7 @@ func GetGPUInfo() GpuInfoList {
 }
 
 func FindGPULibs(baseLibName string, defaultPatterns []string) []string {
+	slog.Debug("FindGPULibs", "baseLibName", baseLibName, "defaultPatterns", defaultPatterns)
 	// Multiple GPU libraries may exist, and some may not work, so keep trying until we exhaust them
 	var ldPaths []string
 	gpuLibPaths := []string{}
@@ -688,6 +745,142 @@ func loadOneapiMgmt(oneapiLibPaths []string) (int, *C.oneapi_handle_t, string, e
 	return 0, nil, "", err
 }
 
+func mtGetGPUInfo() ([]MusaGPUInfo, *musaHandles, error) {
+	resp := []MusaGPUInfo{}
+	if !mtDetected() {
+		return resp, nil, fmt.Errorf("MT GPUs not detected")
+	}
+
+	var memInfo C.mem_info_t
+
+	// Load ALL libraries
+	mHandles := initMusaHandles()
+
+	for i := range mHandles.deviceCount {
+		if mHandles.musart != nil {
+			gpuInfo := MusaGPUInfo{
+				GpuInfo: GpuInfo{
+					Library: "musa",
+				},
+				index: i,
+			}
+			var driverMajor int
+			var driverMinor int
+			if mHandles.musart != nil {
+				C.musart_bootstrap(*mHandles.musart, C.int(i), &memInfo)
+			}
+			if memInfo.err != nil {
+				slog.Info("error looking up nvidia GPU memory", "error", C.GoString(memInfo.err))
+				C.free(unsafe.Pointer(memInfo.err))
+				continue
+			}
+			driverMajor = int(mHandles.musart.driver_major)
+			driverMinor = int(mHandles.musart.driver_minor)
+			gpuInfo.TotalMemory = uint64(memInfo.total)
+			gpuInfo.FreeMemory = uint64(memInfo.free)
+			gpuInfo.ID = C.GoString(&memInfo.gpu_id[0])
+			gpuInfo.Compute = fmt.Sprintf("%d.%d", memInfo.major, memInfo.minor)
+			gpuInfo.computeMajor = int(memInfo.major)
+			gpuInfo.computeMinor = int(memInfo.minor)
+			gpuInfo.MinimumMemory = musaMinimumMemory
+			gpuInfo.DriverMajor = driverMajor
+			gpuInfo.DriverMinor = driverMinor
+			gpuInfo.Name = C.GoString(&memInfo.gpu_name[0])
+
+			slog.Info(fmt.Sprintf("Loaded MUSA GPU: [%d] %s, compute %s", i, gpuInfo.Name, gpuInfo.Compute))
+			/*
+				if int(memInfo.major) < musaComputeMajorMin || (int(memInfo.major) == musaComputeMajorMin && int(memInfo.minor) < musaComputeMinorMin) {
+					unsupportedGPUs = append(unsupportedGPUs,
+						UnsupportedGPUInfo{
+							GpuInfo: gpuInfo.GpuInfo,
+						})
+					slog.Info(fmt.Sprintf("[%d] MUSA GPU is too old. Compute Capability detected: %d.%d", i, memInfo.major, memInfo.minor))
+					continue
+				}
+			*/
+
+			// TODO potentially sort on our own algorithm instead of what the underlying GPU library does...
+			resp = append(resp, gpuInfo)
+		}
+	}
+
+	return resp, mHandles, nil
+}
+
+// Quick check for MT driver so we can skip amdgpu discovery if not present
+func mtDetected() bool {
+	sysfsDir := "/sys/module/mtgpu"
+	_, err := os.Stat(sysfsDir)
+	if errors.Is(err, os.ErrNotExist) {
+		slog.Debug("mtgpu driver not detected " + sysfsDir)
+		return false
+	} else if err != nil {
+		slog.Debug("error looking up mtgpu driver", "path", sysfsDir, "error", err)
+		return false
+	}
+	return true
+}
+
+// Bootstrap the runtime library
+// Returns: num devices, handle, libPath, error
+func loadMUSARTMgmt(musartLibPaths []string) (int, *C.musart_handle_t, string, error) {
+	var resp C.musart_init_resp_t
+	resp.ch.verbose = getVerboseState()
+	var err error
+	for _, libPath := range musartLibPaths {
+		lib := C.CString(libPath)
+		defer C.free(unsafe.Pointer(lib))
+		C.musart_init(lib, &resp)
+		if resp.err != nil {
+			err = fmt.Errorf("Unable to load musart library %s: %s", libPath, C.GoString(resp.err))
+			slog.Debug(err.Error())
+			C.free(unsafe.Pointer(resp.err))
+		} else {
+			err = nil
+			return int(resp.num_devices), &resp.ch, libPath, err
+		}
+	}
+	return 0, nil, "", err
+}
+
+func (mHandles musaHandles) RefreshFreeMemory(gpu MusaGPUInfo) {
+	var memInfo C.mem_info_t
+	if mHandles.musart != nil {
+		C.musart_bootstrap(*mHandles.musart, C.int(gpu.index), &memInfo)
+	} else {
+		// shouldn't happen
+		slog.Warn("no valid musa library loaded to refresh vram usage")
+		return
+	}
+	if memInfo.err != nil {
+		slog.Warn("error looking up mthreads GPU memory", "error", C.GoString(memInfo.err))
+		C.free(unsafe.Pointer(memInfo.err))
+		return
+	}
+	if memInfo.free == 0 {
+		slog.Warn("error looking up mthreads GPU memory")
+		return
+	}
+	slog.Debug("updating musa memory data",
+		"gpu", gpu.ID,
+		"name", gpu.Name,
+		"overhead", format.HumanBytes2(gpu.OSOverhead),
+		slog.Group(
+			"before",
+			"total", format.HumanBytes2(gpu.TotalMemory),
+			"free", format.HumanBytes2(gpu.FreeMemory),
+		),
+		slog.Group(
+			"now",
+			"total", format.HumanBytes2(uint64(memInfo.total)),
+			"free", format.HumanBytes2(uint64(memInfo.free)),
+			"used", format.HumanBytes2(uint64(memInfo.used)),
+		),
+	)
+	gpu.FreeMemory = uint64(memInfo.free)
+	return
+}
+
 func getVerboseState() C.uint16_t {
 	if envconfig.Debug() {
 		return C.uint16_t(1)
@@ -710,6 +903,8 @@ func (l GpuInfoList) GetVisibleDevicesEnv() (string, string) {
 		return rocmGetVisibleDevicesEnv(l)
 	case "oneapi":
 		return oneapiGetVisibleDevicesEnv(l)
+	case "musa":
+		return musaGetVisibleDevicesEnv(l)
 	default:
 		slog.Debug("no filter required for library " + l[0].Library)
 		return "", ""

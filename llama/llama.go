@@ -50,6 +50,9 @@ package llama
 #cgo rocm CFLAGS: -DGGML_USE_CUDA -DGGML_USE_HIP -DGGML_CUDA_DMMV_X=32 -DGGML_CUDA_PEER_MAX_BATCH_SIZE=128 -DGGML_CUDA_MMV_Y=1 -DGGML_BUILD=1
 #cgo rocm CXXFLAGS: -DGGML_USE_CUDA -DGGML_USE_HIP -DGGML_CUDA_DMMV_X=32 -DGGML_CUDA_PEER_MAX_BATCH_SIZE=128 -DGGML_CUDA_MMV_Y=1 -DGGML_BUILD=1
 #cgo rocm LDFLAGS: -L${SRCDIR} -lggml_rocm -lhipblas -lamdhip64 -lrocblas
+#cgo musa CFLAGS: -DGGML_USE_MUSA -DGGML_USE_CUDA -DGGML_CUDA_PEER_MAX_BATCH_SIZE=128 -DGGML_BUILD=1
+#cgo musa CXXFLAGS: -DGGML_USE_MUSA -DGGML_USE_CUDA -DGGML_CUDA_PEER_MAX_BATCH_SIZE=128 -DGGML_BUILD=1
+#cgo musa LDFLAGS: -L${SRCDIR} -lggml_musa -lmusa -lmusart -lmublas
 #cgo windows CFLAGS: -Wno-discarded-qualifiers -D_WIN32_WINNT=0x602
 #cgo windows CXXFLAGS: -D_WIN32_WINNT=0x602
 #cgo windows LDFLAGS: -lmsvcrt -static-libstdc++ -static-libgcc -static

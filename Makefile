@@ -6,6 +6,7 @@ include make/common-defs.make
 include make/cuda-v11-defs.make
 include make/cuda-v12-defs.make
 include make/rocm-defs.make
+include make/musa-defs.make
 
 ifeq ($(CUSTOM_CPU_FLAGS),)
 ifeq ($(ARCH),amd64)
@@ -31,6 +32,12 @@ endif
 ifeq ($(OLLAMA_SKIP_ROCM_GENERATE),)
 ifneq ($(HIP_COMPILER),)
 	RUNNER_TARGETS += rocm
+endif
+endif
+
+ifeq ($(OLLAMA_SKIP_MUSA_GENERATE),)
+ifneq ($(MUSA_COMPILER),)
+	RUNNER_TARGETS += musa
 endif
 endif
 
